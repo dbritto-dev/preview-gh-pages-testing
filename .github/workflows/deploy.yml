@@ -1,0 +1,130 @@
+name: PR Preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+
+concurrency: preview-${{ github.ref }}
+
+jobs:
+  deploy-preview:
+    if: github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: npm run build
+        env:
+          BASE_PATH: /${{ github.event.repository.name }}/pr/${{ github.event.number }}
+
+      - name: Deploy to gh-pages
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Clone just the gh-pages branch
+          git fetch origin gh-pages:gh-pages || true
+          git worktree add gh-pages-dir gh-pages || {
+            git checkout --orphan gh-pages
+            git reset --hard
+            git commit --allow-empty -m "Init gh-pages"
+            git push origin gh-pages
+            git checkout -
+            git worktree add gh-pages-dir gh-pages
+          }
+
+          # Copy build output to pr subdirectory
+          PR_DIR="gh-pages-dir/pr/${{ github.event.number }}"
+          rm -rf "$PR_DIR"
+          mkdir -p "$PR_DIR"
+          cp -r dist/* "$PR_DIR/"
+
+          # Push
+          cd gh-pages-dir
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "Deploy preview for PR #${{ github.event.number }}"
+          git push origin gh-pages
+
+      - name: Comment on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const url = `https://${context.repo.owner}.github.io/${context.repo.repo}/pr/${context.issue.number}/`;
+            const body = `🔍 **Preview deployed!**\n\n${url}`;
+
+            // Update existing comment or create new one
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c => 
+              c.user.login === 'github-actions[bot]' && c.body.includes('Preview deployed')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: body + `\n\n_Updated: ${new Date().toISOString()}_`,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Set commit status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: context.sha,
+              state: 'success',
+              target_url: `https://${context.repo.owner}.github.io/${context.repo.repo}/pr/${context.issue.number}/`,
+              context: 'Preview',
+              description: 'Preview is live',
+            });
+
+  cleanup-preview:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Remove preview
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin gh-pages:gh-pages || exit 0
+          git worktree add gh-pages-dir gh-pages
+
+          PR_DIR="gh-pages-dir/pr/${{ github.event.number }}"
+          if [ -d "$PR_DIR" ]; then
+            rm -rf "$PR_DIR"
+            cd gh-pages-dir
+            git add -A
+            git diff --cached --quiet && exit 0
+            git commit -m "Remove preview for PR #${{ github.event.number }}"
+            git push origin gh-pages
+          fi
